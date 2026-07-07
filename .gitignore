@@ -1,0 +1,12 @@
+# Build output
+dist/
+*.so
+*.dll
+*.dylib
+*.h
+
+# Local database
+usage.db
+usage.db-*
+*.sqlite
+*.sqlite-*
