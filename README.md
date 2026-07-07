@@ -102,4 +102,4 @@ bash ./build.sh
 
 ## 说明
 
-- 本插件仅使用上游 `UsageRecord` ABI 现有字段。上游未提供 `endpoint`、`request_id`，故不记录；失败判定为 `Failed || failure_status_code >= 400`。
+- 本插件仅使用上游 `UsageRecord` ABI 现有字段。失败判定为 `Failed || failure_status_code >= 400`。

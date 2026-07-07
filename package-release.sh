@@ -32,11 +32,25 @@ tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT
 
 cp "${artifact}" "${tmp_dir}/${artifact}"
-if ! command -v zip >/dev/null 2>&1; then
-  echo "zip is required to package the release (install zip / mingw-w64 zip)" >&2
+if command -v zip >/dev/null 2>&1; then
+  (cd "${tmp_dir}" && zip -9 -q "${OLDPWD}/${out_dir}/${zip_name}" "${artifact}")
+elif command -v python3 >/dev/null 2>&1; then
+  python3 - "${tmp_dir}" "${artifact}" "${out_dir}/${zip_name}" <<'PY'
+import pathlib
+import sys
+import zipfile
+
+tmp_dir = pathlib.Path(sys.argv[1])
+artifact = sys.argv[2]
+zip_path = pathlib.Path(sys.argv[3])
+zip_path.parent.mkdir(parents=True, exist_ok=True)
+with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+    zf.write(tmp_dir / artifact, artifact)
+PY
+else
+  echo "need zip or python3 to package the release" >&2
   exit 1
 fi
-(cd "${tmp_dir}" && zip -9 -q "${OLDPWD}/${out_dir}/${zip_name}" "${artifact}")
 
 (
   cd "${out_dir}"
