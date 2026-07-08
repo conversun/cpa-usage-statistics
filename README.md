@@ -91,15 +91,6 @@ Content-Type: application/json
 
 响应：`{"deleted": 1, "missing": ["..."]}`。
 
-## 从源码构建
-
-```bash
-# c-shared 需要 CGO_ENABLED=1 与 C 工具链（gcc / mingw-w64）
-bash ./build.sh
-```
-
-发布由 `v*.*.*` tag 触发 GitHub Action，跨 linux/darwin/windows 构建，产物 `usage-statistics_<版本>_<goos>_<goarch>.zip` + `checksums.txt`。
-
 ## 说明
 
 - 本插件仅使用上游 `UsageRecord` ABI 现有字段。失败判定为 `Failed || failure_status_code >= 400`。
