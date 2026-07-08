@@ -1,15 +1,18 @@
 # CPA Usage Statistics
 
-CLIProxyAPI 的持久化用量统计插件。以 UsagePlugin 能力接收每次请求的用量记录，写入本地 SQLite；以 ManagementAPI 能力提供查询/删除接口。字段命名对齐上游 `usage.Record` / `usage.Detail`，可直接运行在纯上游宿主上。
+CLIProxyAPI 的持久化用量统计插件。记录每次请求的用量，写入本地 SQLite；提供查询/删除接口。字段命名对齐上游 `usage.Record` / `usage.Detail`。
 
 当前版本：`0.1.0`
 
+## 建议使用配套的前端面板
+
+[配套面板](https://github.com/Fwindy/Cli-Proxy-API-Management-Center)
+
 ## 功能
 
-- 接收上游用量记录并持久化到 SQLite（纯 Go 驱动 `modernc.org/sqlite`，无需 CGO SQLite）。
+- 接收上游用量记录并持久化到 SQLite。
 - 提供受管理鉴权保护的查询/删除接口。
 - 可选按天数保留清理。
-- 字段与上游命名一致：`reasoning_effort` / `ttft_ms` / `failure_status_code` / `failure_body`，并补齐 `cache_read_tokens` / `cache_creation_tokens`。
 
 ## 安装
 
