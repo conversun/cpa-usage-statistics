@@ -96,7 +96,81 @@ func (s *SQLiteStore) initSchema(ctx context.Context) error {
 			return fmt.Errorf("usage sqlite init schema: %w", err)
 		}
 	}
+	return s.migrateSchema(ctx)
+}
+
+// migrateSchema 让老版本 db 的字段自愈到最新：用 table_info 读出现有列，
+// 对最新 schema 中缺失的列逐个 ALTER TABLE ADD COLUMN 补齐（SQLite 不能重复
+// ADD，同名列跳过）。id/timestamp 是建表原始列（任何版本都有）且不可 ADD，
+// 不在补齐范围。ADD COLUMN 只带 NOT NULL DEFAULT、不带 CHECK（SQLite 对
+// ADD COLUMN 的约束限制），数值非负由写入侧 nonNegative 保证。
+func (s *SQLiteStore) migrateSchema(ctx context.Context) error {
+	existing, err := s.existingColumns(ctx)
+	if err != nil {
+		return err
+	}
+	additions := []struct {
+		name string
+		ddl  string
+	}{
+		{"api_key", `ALTER TABLE usage_records ADD COLUMN api_key TEXT NOT NULL DEFAULT ''`},
+		{"provider", `ALTER TABLE usage_records ADD COLUMN provider TEXT NOT NULL DEFAULT ''`},
+		{"model", `ALTER TABLE usage_records ADD COLUMN model TEXT NOT NULL DEFAULT ''`},
+		{"alias", `ALTER TABLE usage_records ADD COLUMN alias TEXT NOT NULL DEFAULT ''`},
+		{"source", `ALTER TABLE usage_records ADD COLUMN source TEXT NOT NULL DEFAULT ''`},
+		{"auth_id", `ALTER TABLE usage_records ADD COLUMN auth_id TEXT NOT NULL DEFAULT ''`},
+		{"auth_index", `ALTER TABLE usage_records ADD COLUMN auth_index TEXT NOT NULL DEFAULT ''`},
+		{"auth_type", `ALTER TABLE usage_records ADD COLUMN auth_type TEXT NOT NULL DEFAULT ''`},
+		{"executor_type", `ALTER TABLE usage_records ADD COLUMN executor_type TEXT NOT NULL DEFAULT ''`},
+		{"reasoning_effort", `ALTER TABLE usage_records ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT ''`},
+		{"service_tier", `ALTER TABLE usage_records ADD COLUMN service_tier TEXT NOT NULL DEFAULT ''`},
+		{"latency_ms", `ALTER TABLE usage_records ADD COLUMN latency_ms INTEGER NOT NULL DEFAULT 0`},
+		{"ttft_ms", `ALTER TABLE usage_records ADD COLUMN ttft_ms INTEGER NOT NULL DEFAULT 0`},
+		{"input_tokens", `ALTER TABLE usage_records ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0`},
+		{"output_tokens", `ALTER TABLE usage_records ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0`},
+		{"reasoning_tokens", `ALTER TABLE usage_records ADD COLUMN reasoning_tokens INTEGER NOT NULL DEFAULT 0`},
+		{"cached_tokens", `ALTER TABLE usage_records ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0`},
+		{"cache_read_tokens", `ALTER TABLE usage_records ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0`},
+		{"cache_creation_tokens", `ALTER TABLE usage_records ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0`},
+		{"total_tokens", `ALTER TABLE usage_records ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0`},
+		{"failed", `ALTER TABLE usage_records ADD COLUMN failed INTEGER NOT NULL DEFAULT 0`},
+		{"failure_status_code", `ALTER TABLE usage_records ADD COLUMN failure_status_code INTEGER NOT NULL DEFAULT 0`},
+		{"failure_body", `ALTER TABLE usage_records ADD COLUMN failure_body TEXT NOT NULL DEFAULT ''`},
+	}
+	for _, addition := range additions {
+		if _, ok := existing[addition.name]; ok {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx, addition.ddl); err != nil {
+			return fmt.Errorf("usage sqlite migrate add %s: %w", addition.name, err)
+		}
+	}
 	return nil
+}
+
+// existingColumns 返回 usage_records 当前已有的列名集合。
+func (s *SQLiteStore) existingColumns(ctx context.Context) (map[string]struct{}, error) {
+	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info(usage_records)")
+	if err != nil {
+		return nil, fmt.Errorf("usage sqlite table_info: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	columns := make(map[string]struct{})
+	for rows.Next() {
+		var (
+			cid       int
+			name      string
+			ctype     string
+			notNull   int
+			dfltValue sql.NullString
+			pk        int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dfltValue, &pk); err != nil {
+			return nil, fmt.Errorf("usage sqlite table_info scan: %w", err)
+		}
+		columns[name] = struct{}{}
+	}
+	return columns, rows.Err()
 }
 
 // Insert stores one usage record.
