@@ -1063,6 +1063,95 @@ func TestRouteSuffix(t *testing.T) {
 	}
 }
 
+// TestRecordsDescendingPaging: a "recent activity" table wants the NEWEST rows
+// first. Ascending paging would have to walk the whole range to reach them.
+//
+// The cursor comparison must flip with the sort order -- keeping `>` while
+// ordering DESC makes the second page jump back to the oldest rows, which looks
+// like data corruption rather than a paging bug.
+func TestRecordsDescendingPaging(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	total := 25
+	bulkInsert(t, store, total, time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC))
+
+	first, err := store.Records(ctx, RecordsQuery{Order: OrderDesc, Limit: 10})
+	if err != nil {
+		t.Fatalf("Records desc: %v", err)
+	}
+	if len(first.Records) != 10 || !first.HasMore {
+		t.Fatalf("page 1 = %d records has_more=%v", len(first.Records), first.HasMore)
+	}
+	// Newest first: bulk-000024 down to bulk-000015.
+	if first.Records[0].ID != fmt.Sprintf("bulk-%06d", total-1) {
+		t.Fatalf("newest = %s, want bulk-%06d", first.Records[0].ID, total-1)
+	}
+	for i := 1; i < len(first.Records); i++ {
+		if first.Records[i].Timestamp.After(first.Records[i-1].Timestamp) {
+			t.Fatalf("not descending at %d", i)
+		}
+	}
+
+	// Walk every page and assert the full set comes back exactly once, in
+	// strictly descending order.
+	seen := make([]string, 0, total)
+	for _, r := range first.Records {
+		seen = append(seen, r.ID)
+	}
+	cursor := first.NextCursor
+	for page := 0; page < 20 && cursor != ""; page++ {
+		afterTS, afterID, ok := decodeCursor(cursor)
+		if !ok {
+			t.Fatalf("cursor did not decode")
+		}
+		next, errPage := store.Records(ctx, RecordsQuery{
+			Order: OrderDesc, Limit: 10, AfterTS: afterTS, AfterID: afterID,
+		})
+		if errPage != nil {
+			t.Fatalf("Records desc page: %v", errPage)
+		}
+		if len(next.Records) == 0 {
+			t.Fatalf("page %d empty; cursor is not advancing", page)
+		}
+		for _, r := range next.Records {
+			seen = append(seen, r.ID)
+		}
+		if !next.HasMore {
+			break
+		}
+		cursor = next.NextCursor
+	}
+	if len(seen) != total {
+		t.Fatalf("paged %d ids, want %d", len(seen), total)
+	}
+	for i, id := range seen {
+		if want := fmt.Sprintf("bulk-%06d", total-1-i); id != want {
+			t.Fatalf("position %d = %s, want %s", i, id, want)
+		}
+	}
+}
+
+// TestRecordsDefaultOrderStaysAscending pins backward compatibility: an existing
+// caller that never sends `order` must keep the original ordering.
+func TestRecordsDefaultOrderStaysAscending(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	bulkInsert(t, store, 5, time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC))
+	page, err := store.Records(ctx, RecordsQuery{Limit: 5})
+	if err != nil {
+		t.Fatalf("Records: %v", err)
+	}
+	if page.Records[0].ID != "bulk-000000" {
+		t.Fatalf("first = %s, want bulk-000000 (ascending default)", page.Records[0].ID)
+	}
+	if normalizeOrder("") != OrderAsc || normalizeOrder("nonsense") != OrderAsc {
+		t.Fatalf("unknown order should fall back to ascending")
+	}
+	if normalizeOrder("desc") != OrderDesc {
+		t.Fatalf("desc not recognised")
+	}
+}
+
 // TestRecordsPagesThroughTiedTimestamps: every row shares one timestamp, so
 // paging depends entirely on the id half of the (timestamp, id) cursor. The
 // unique-timestamp fixture in TestRecordsKeysetPagination would still pass if

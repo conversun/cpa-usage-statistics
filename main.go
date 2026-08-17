@@ -423,6 +423,7 @@ func usageRecordsGet(req managementRequest) ([]byte, error) {
 		Provider:   strings.TrimSpace(firstValue(req.Query, "provider")),
 		Model:      strings.TrimSpace(firstValue(req.Query, "model")),
 		FailedOnly: isTruthy(firstValue(req.Query, "failed")),
+		Order:      normalizeOrder(strings.TrimSpace(firstValue(req.Query, "order"))),
 		Limit:      parseLimit(firstValue(req.Query, "limit")),
 	}
 	if raw := strings.TrimSpace(firstValue(req.Query, "cursor")); raw != "" {

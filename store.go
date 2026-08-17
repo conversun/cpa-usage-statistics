@@ -529,9 +529,16 @@ func (s *SQLiteStore) Records(ctx context.Context, q RecordsQuery) (RecordsPage,
 	if q.FailedOnly {
 		conds = append(conds, "failed = 1")
 	}
+	descending := q.Order == OrderDesc
 	if ts := strings.TrimSpace(q.AfterTS); ts != "" {
-		// Row-value comparison so SQLite turns the cursor into an index seek.
-		conds = append(conds, "(timestamp, id) > (?, ?)")
+		// Row-value comparison so SQLite turns the cursor into an index seek. The
+		// direction must match the sort order or the cursor walks the wrong way and
+		// the caller either loops on one page or skips the rest.
+		if descending {
+			conds = append(conds, "(timestamp, id) < (?, ?)")
+		} else {
+			conds = append(conds, "(timestamp, id) > (?, ?)")
+		}
 		args = append(args, ts, strings.TrimSpace(q.AfterID))
 	}
 
@@ -551,7 +558,7 @@ func (s *SQLiteStore) Records(ctx context.Context, q RecordsQuery) (RecordsPage,
 	args = append(args, limit+1)
 	query := `SELECT ` + recordColumns + `, ` + bodyExpr + `
 FROM usage_records` + whereClause(conds) + `
-ORDER BY timestamp ASC, id ASC
+ORDER BY timestamp ` + orderKeyword(descending) + `, id ` + orderKeyword(descending) + `
 LIMIT ?`
 
 	rows, err := s.db.QueryContext(ctx, query, args...)

@@ -98,10 +98,12 @@ GET /v0/management/plugins/usage-statistics/usage/summary
 GET /v0/management/plugins/usage-statistics/usage/records
     ?start=<RFC3339>&end=<RFC3339>
     &api_key=&provider=&model=&failed=true
-    &limit=100&cursor=<next_cursor>
+    &order=asc|desc&limit=100&cursor=<next_cursor>
 ```
 
 按 `(timestamp, id)` 游标分页，翻到第 N 页与第 1 页开销相同。把响应里的 `next_cursor` 原样回传即可取下一页；`has_more` 为 `false` 时到底。`limit` 缺省 100、上限 1000。
+
+`order` 缺省 `asc`（与旧接口排序一致）。做「最近请求」这类列表请用 `order=desc`，否则要把整个时间范围翻完才能拿到最新的几条。
 
 列表里的 `failure_body` 只返回前 500 字节（按 UTF-8 边界截断，不会切断多字节字符）。要完整错误文本，用 `?id=<record-id>` 查单条。
 

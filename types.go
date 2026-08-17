@@ -167,9 +167,37 @@ type SummaryResult struct {
 	Truncated bool            `json:"truncated"`
 }
 
+// SortOrder selects the direction raw records are paged in.
+type SortOrder string
+
+const (
+	OrderAsc  SortOrder = "asc"
+	OrderDesc SortOrder = "desc"
+)
+
+// normalizeOrder defaults to ascending, matching the legacy query's ordering.
+func normalizeOrder(raw string) SortOrder {
+	if SortOrder(raw) == OrderDesc {
+		return OrderDesc
+	}
+	return OrderAsc
+}
+
+// orderKeyword renders the SQL sort direction. The value comes from a closed
+// enum, never from caller input.
+func orderKeyword(descending bool) string {
+	if descending {
+		return "DESC"
+	}
+	return "ASC"
+}
+
 // RecordsQuery selects raw records for drill-down. Paging is keyset based on
 // (timestamp, id), which is the table's sort order, so page N costs the same as
 // page 1 -- unlike OFFSET, which re-walks every skipped row.
+//
+// Order matters for a "most recent activity" table: ascending paging would have
+// to walk the entire range before reaching the newest rows.
 type RecordsQuery struct {
 	Range      QueryRange
 	ID         string
@@ -177,6 +205,7 @@ type RecordsQuery struct {
 	Provider   string
 	Model      string
 	FailedOnly bool
+	Order      SortOrder
 	AfterTS    string
 	AfterID    string
 	Limit      int
