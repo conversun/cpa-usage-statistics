@@ -566,6 +566,290 @@ func TestSummaryRespectsRange(t *testing.T) {
 	}
 }
 
+// TestSummaryGroupsByCredential: one api_key can be served by several auth
+// entries, and callers attribute usage to the credential. Grouping by api_key
+// alone would silently merge them into one row.
+func TestSummaryGroupsByCredential(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	ts := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	for _, r := range []Record{
+		{ID: "a1", Timestamp: ts, APIKey: "k", Provider: "p", Model: "m", Source: "claude-code", AuthIndex: "auth-1"},
+		{ID: "a2", Timestamp: ts, APIKey: "k", Provider: "p", Model: "m", Source: "claude-code", AuthIndex: "auth-1"},
+		{ID: "b1", Timestamp: ts, APIKey: "k", Provider: "p", Model: "m", Source: "claude-code", AuthIndex: "auth-2"},
+		{ID: "c1", Timestamp: ts, APIKey: "k", Provider: "p", Model: "m", Source: "opencode", AuthIndex: "auth-1"},
+	} {
+		if err := store.Insert(ctx, r); err != nil {
+			t.Fatalf("Insert %s: %v", r.ID, err)
+		}
+	}
+	result, err := store.Summary(ctx, SummaryQuery{Bucket: BucketDay})
+	if err != nil {
+		t.Fatalf("Summary: %v", err)
+	}
+	if len(result.Buckets) != 3 {
+		t.Fatalf("buckets = %d, want 3 (auth-1/auth-2/opencode split): %+v", len(result.Buckets), result.Buckets)
+	}
+	got := map[string]int64{}
+	for _, b := range result.Buckets {
+		got[b.Source+"|"+b.AuthIndex] = b.Requests
+	}
+	for key, want := range map[string]int64{
+		"claude-code|auth-1": 2,
+		"claude-code|auth-2": 1,
+		"opencode|auth-1":    1,
+	} {
+		if got[key] != want {
+			t.Fatalf("%s = %d, want %d (all: %v)", key, got[key], want, got)
+		}
+	}
+}
+
+// TestSummaryExcludesZeroTimingsFromAverages: a request that reported no first
+// byte has ttft_ms = 0. Averaging those zeros in would drag the mean down, so
+// they are excluded and the sample count is reported separately.
+func TestSummaryExcludesZeroTimingsFromAverages(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	ts := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	for _, r := range []Record{
+		{ID: "t1", Timestamp: ts, APIKey: "k", Model: "m", LatencyMs: 100, TTFTMs: 200},
+		{ID: "t2", Timestamp: ts, APIKey: "k", Model: "m", LatencyMs: 300, TTFTMs: 400},
+		{ID: "t3", Timestamp: ts, APIKey: "k", Model: "m", LatencyMs: 0, TTFTMs: 0},
+	} {
+		if err := store.Insert(ctx, r); err != nil {
+			t.Fatalf("Insert %s: %v", r.ID, err)
+		}
+	}
+	result, err := store.Summary(ctx, SummaryQuery{Bucket: BucketDay})
+	if err != nil {
+		t.Fatalf("Summary: %v", err)
+	}
+	if len(result.Buckets) != 1 {
+		t.Fatalf("buckets = %d, want 1", len(result.Buckets))
+	}
+	b := result.Buckets[0]
+	if b.Requests != 3 {
+		t.Fatalf("requests = %d, want 3 (the zero-timing row still counts)", b.Requests)
+	}
+	// (100+300)/2 = 200, NOT (100+300+0)/3 = 133.
+	if b.AvgLatencyMs != 200 || b.LatencySamples != 2 {
+		t.Fatalf("latency avg=%d samples=%d, want 200/2", b.AvgLatencyMs, b.LatencySamples)
+	}
+	// (200+400)/2 = 300, NOT (200+400+0)/3 = 200.
+	if b.AvgTTFTMs != 300 || b.TTFTSamples != 2 {
+		t.Fatalf("ttft avg=%d samples=%d, want 300/2", b.AvgTTFTMs, b.TTFTSamples)
+	}
+	if b.MaxLatencyMs != 300 || b.MaxTTFTMs != 400 {
+		t.Fatalf("max latency=%d ttft=%d, want 300/400", b.MaxLatencyMs, b.MaxTTFTMs)
+	}
+}
+
+// TestSummaryAllZeroTimingsDoesNotProduceNull: avg() over an all-NULL CASE is
+// NULL, which would fail the int64 scan without the COALESCE.
+func TestSummaryAllZeroTimingsDoesNotProduceNull(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if err := store.Insert(ctx, Record{ID: "z", Timestamp: time.Now(), APIKey: "k", Model: "m"}); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	result, err := store.Summary(ctx, SummaryQuery{Bucket: BucketDay})
+	if err != nil {
+		t.Fatalf("Summary: %v", err)
+	}
+	b := result.Buckets[0]
+	if b.AvgLatencyMs != 0 || b.AvgTTFTMs != 0 || b.LatencySamples != 0 || b.TTFTSamples != 0 {
+		t.Fatalf("all-zero bucket = %+v, want zeroed averages and sample counts", b)
+	}
+}
+
+// TestSummaryFifteenMinuteBuckets checks the minute-flooring arithmetic, which
+// is the only bucket that is not a plain timestamp prefix.
+func TestSummaryFifteenMinuteBuckets(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 5, 1, 6, 0, 0, 0, time.UTC)
+	cases := []struct {
+		id     string
+		offset time.Duration
+		want   string
+	}{
+		{"m00", 0, "2026-05-01T06:00"},
+		{"m07", 7 * time.Minute, "2026-05-01T06:00"},
+		{"m15", 15 * time.Minute, "2026-05-01T06:15"},
+		{"m29", 29 * time.Minute, "2026-05-01T06:15"},
+		{"m30", 30 * time.Minute, "2026-05-01T06:30"},
+		{"m45", 45 * time.Minute, "2026-05-01T06:45"},
+		{"m59", 59 * time.Minute, "2026-05-01T06:45"},
+	}
+	for _, c := range cases {
+		if err := store.Insert(ctx, Record{ID: c.id, Timestamp: base.Add(c.offset), APIKey: "k", Model: "m"}); err != nil {
+			t.Fatalf("Insert %s: %v", c.id, err)
+		}
+	}
+	result, err := store.Summary(ctx, SummaryQuery{Bucket: BucketFifteenMin})
+	if err != nil {
+		t.Fatalf("Summary: %v", err)
+	}
+	if result.BucketBy != BucketFifteenMin {
+		t.Fatalf("bucket_by = %q, want 15m", result.BucketBy)
+	}
+	counts := map[string]int64{}
+	for _, b := range result.Buckets {
+		counts[b.Bucket] += b.Requests
+	}
+	for bucket, want := range map[string]int64{
+		"2026-05-01T06:00": 2,
+		"2026-05-01T06:15": 2,
+		"2026-05-01T06:30": 1,
+		"2026-05-01T06:45": 2,
+	} {
+		if counts[bucket] != want {
+			t.Fatalf("bucket %s = %d, want %d (all: %v)", bucket, counts[bucket], want, counts)
+		}
+	}
+}
+
+// TestSummaryMatchesRawRecords is the contract the whole aggregate-first
+// migration rests on: whatever a caller would have computed by summing raw
+// records must equal what the summary reports. If these ever diverge, dashboards
+// silently show wrong numbers.
+func TestSummaryMatchesRawRecords(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+	sources := []string{"claude-code", "opencode"}
+	auths := []string{"auth-1", "auth-2"}
+	models := []string{"m1", "m2"}
+
+	for i := 0; i < 120; i++ {
+		rec := Record{
+			ID:        fmt.Sprintf("parity-%03d", i),
+			Timestamp: base.Add(time.Duration(i) * 7 * time.Minute),
+			APIKey:    "k",
+			Provider:  "p",
+			Model:     models[i%len(models)],
+			Source:    sources[i%len(sources)],
+			AuthIndex: auths[(i/2)%len(auths)],
+			LatencyMs: int64(i % 5 * 100), // deliberately produces some zeros
+			TTFTMs:    int64(i % 3 * 50),  // deliberately produces some zeros
+			Failed:    i%7 == 0,
+			Tokens: TokenStats{
+				InputTokens: int64(i), OutputTokens: int64(i * 2), TotalTokens: int64(i * 3),
+			},
+		}
+		if err := store.Insert(ctx, rec); err != nil {
+			t.Fatalf("Insert %d: %v", i, err)
+		}
+	}
+
+	summary, err := store.Summary(ctx, SummaryQuery{Bucket: BucketDay})
+	if err != nil {
+		t.Fatalf("Summary: %v", err)
+	}
+
+	// Walk every raw record through the paginated endpoint and aggregate by hand.
+	type agg struct {
+		requests, failures         int64
+		input, output, total       int64
+		latencySum, latencySamples int64
+		ttftSum, ttftSamples       int64
+		maxLatency, maxTTFT        int64
+	}
+	raw := map[string]*agg{}
+	cursor := ""
+	seen := 0
+	for page := 0; page < 50; page++ {
+		q := RecordsQuery{Limit: 25}
+		if cursor != "" {
+			afterTS, afterID, ok := decodeCursor(cursor)
+			if !ok {
+				t.Fatalf("cursor did not decode")
+			}
+			q.AfterTS, q.AfterID = afterTS, afterID
+		}
+		result, errRecords := store.Records(ctx, q)
+		if errRecords != nil {
+			t.Fatalf("Records: %v", errRecords)
+		}
+		for _, r := range result.Records {
+			seen++
+			key := r.Timestamp.UTC().Format("2006-01-02") + "|" + r.APIKey + "|" + r.Provider +
+				"|" + r.Model + "|" + r.Source + "|" + r.AuthIndex
+			a := raw[key]
+			if a == nil {
+				a = &agg{}
+				raw[key] = a
+			}
+			a.requests++
+			if r.Failed {
+				a.failures++
+			}
+			a.input += r.Tokens.InputTokens
+			a.output += r.Tokens.OutputTokens
+			a.total += r.Tokens.TotalTokens
+			if r.LatencyMs > 0 {
+				a.latencySum += r.LatencyMs
+				a.latencySamples++
+			}
+			if r.LatencyMs > a.maxLatency {
+				a.maxLatency = r.LatencyMs
+			}
+			if r.TTFTMs > 0 {
+				a.ttftSum += r.TTFTMs
+				a.ttftSamples++
+			}
+			if r.TTFTMs > a.maxTTFT {
+				a.maxTTFT = r.TTFTMs
+			}
+		}
+		if !result.HasMore {
+			break
+		}
+		cursor = result.NextCursor
+	}
+	if seen != 120 {
+		t.Fatalf("paged %d raw records, want 120", seen)
+	}
+	if len(summary.Buckets) != len(raw) {
+		t.Fatalf("summary has %d buckets, raw aggregation has %d", len(summary.Buckets), len(raw))
+	}
+
+	for _, b := range summary.Buckets {
+		key := b.Bucket + "|" + b.APIKey + "|" + b.Provider + "|" + b.Model + "|" + b.Source + "|" + b.AuthIndex
+		a := raw[key]
+		if a == nil {
+			t.Fatalf("summary bucket %q has no raw counterpart", key)
+		}
+		if b.Requests != a.requests || b.Failures != a.failures {
+			t.Fatalf("%s: requests/failures = %d/%d, raw = %d/%d", key, b.Requests, b.Failures, a.requests, a.failures)
+		}
+		if b.Tokens.InputTokens != a.input || b.Tokens.OutputTokens != a.output || b.Tokens.TotalTokens != a.total {
+			t.Fatalf("%s: tokens = %+v, raw in/out/total = %d/%d/%d", key, b.Tokens, a.input, a.output, a.total)
+		}
+		if b.LatencySamples != a.latencySamples || b.TTFTSamples != a.ttftSamples {
+			t.Fatalf("%s: samples latency/ttft = %d/%d, raw = %d/%d",
+				key, b.LatencySamples, b.TTFTSamples, a.latencySamples, a.ttftSamples)
+		}
+		if b.MaxLatencyMs != a.maxLatency || b.MaxTTFTMs != a.maxTTFT {
+			t.Fatalf("%s: max latency/ttft = %d/%d, raw = %d/%d", key, b.MaxLatencyMs, b.MaxTTFTMs, a.maxLatency, a.maxTTFT)
+		}
+		// SQLite truncates toward zero on the INTEGER cast, so mirror that here.
+		wantAvgLatency := int64(0)
+		if a.latencySamples > 0 {
+			wantAvgLatency = a.latencySum / a.latencySamples
+		}
+		wantAvgTTFT := int64(0)
+		if a.ttftSamples > 0 {
+			wantAvgTTFT = a.ttftSum / a.ttftSamples
+		}
+		if b.AvgLatencyMs != wantAvgLatency || b.AvgTTFTMs != wantAvgTTFT {
+			t.Fatalf("%s: avg latency/ttft = %d/%d, raw = %d/%d",
+				key, b.AvgLatencyMs, b.AvgTTFTMs, wantAvgLatency, wantAvgTTFT)
+		}
+	}
+}
+
 // TestRecordsKeysetPagination walks every page and asserts the union is exactly
 // the input with no duplicates and no gaps -- the two ways keyset paging breaks.
 func TestRecordsKeysetPagination(t *testing.T) {

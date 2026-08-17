@@ -78,32 +78,43 @@ type DeleteResult struct {
 	Missing []string `json:"missing"`
 }
 
-// BucketSize selects the summary time-bucket granularity. The stored timestamp
-// is a fixed-width RFC3339Nano UTC string, so a bucket is just a prefix of it.
+// BucketSize selects the summary time-bucket granularity.
 type BucketSize string
 
 const (
-	BucketHour  BucketSize = "hour"
-	BucketDay   BucketSize = "day"
-	BucketMonth BucketSize = "month"
+	// BucketFifteenMin exists because a service-health grid needs sub-hour cells;
+	// hourly buckets cannot be split back into quarters client-side.
+	BucketFifteenMin BucketSize = "15m"
+	BucketHour       BucketSize = "hour"
+	BucketDay        BucketSize = "day"
+	BucketMonth      BucketSize = "month"
 )
 
-// prefixLen returns how many leading timestamp characters identify the bucket:
-// 2026-08-17T06 (hour), 2026-08-17 (day), 2026-08 (month).
-func (b BucketSize) prefixLen() int {
+// bucketExpr returns the SQL expression mapping a stored timestamp to this
+// bucket's key. The stored value is a fixed-width RFC3339Nano UTC string
+// (2026-08-17T06:32:58.679824136Z), so most granularities are a plain prefix.
+//
+// The quarter-hour case floors the minute instead: characters 1..14 are
+// "2026-08-17T06:" and characters 15..16 are the minute, so dividing by 15 and
+// multiplying back yields 2026-08-17T06:30.
+func (b BucketSize) bucketExpr() string {
 	switch b {
+	case BucketFifteenMin:
+		return `substr(timestamp, 1, 14) || printf('%02d', (CAST(substr(timestamp, 15, 2) AS INTEGER) / 15) * 15)`
 	case BucketHour:
-		return 13
+		return `substr(timestamp, 1, 13)`
 	case BucketMonth:
-		return 7
+		return `substr(timestamp, 1, 7)`
 	default:
-		return 10
+		return `substr(timestamp, 1, 10)`
 	}
 }
 
 // normalizeBucket maps free-form input to a supported bucket, defaulting to day.
 func normalizeBucket(raw string) BucketSize {
 	switch BucketSize(raw) {
+	case BucketFifteenMin:
+		return BucketFifteenMin
 	case BucketHour:
 		return BucketHour
 	case BucketMonth:
@@ -120,19 +131,33 @@ type SummaryQuery struct {
 }
 
 // SummaryBucket is one pre-aggregated row. Aggregation happens in SQL, so the
-// response size is bounded by distinct (bucket, api_key, provider, model)
-// combinations rather than by the number of underlying requests.
+// response size is bounded by distinct dimension combinations rather than by the
+// number of underlying requests.
+//
+// source and auth_index are part of the key because callers attribute usage to a
+// credential, not just to an API key: one key can be served by many auth entries.
 type SummaryBucket struct {
-	Bucket       string     `json:"bucket"`
-	APIKey       string     `json:"api_key"`
-	Provider     string     `json:"provider"`
-	Model        string     `json:"model"`
-	Requests     int64      `json:"requests"`
-	Failures     int64      `json:"failures"`
-	Tokens       TokenStats `json:"tokens"`
-	AvgLatencyMs int64      `json:"avg_latency_ms"`
-	MaxLatencyMs int64      `json:"max_latency_ms"`
-	AvgTTFTMs    int64      `json:"avg_ttft_ms"`
+	Bucket    string `json:"bucket"`
+	APIKey    string `json:"api_key"`
+	Provider  string `json:"provider"`
+	Model     string `json:"model"`
+	Source    string `json:"source"`
+	AuthIndex string `json:"auth_index"`
+
+	Requests int64      `json:"requests"`
+	Failures int64      `json:"failures"`
+	Tokens   TokenStats `json:"tokens"`
+
+	// Averages are taken over the rows that actually reported a value, and the
+	// sample counts are returned so callers can re-weight across buckets. Without
+	// them a client cannot combine two buckets' averages correctly, and rows that
+	// never reported a timing would silently drag the mean toward zero.
+	AvgLatencyMs   int64 `json:"avg_latency_ms"`
+	MaxLatencyMs   int64 `json:"max_latency_ms"`
+	LatencySamples int64 `json:"latency_samples"`
+	AvgTTFTMs      int64 `json:"avg_ttft_ms"`
+	MaxTTFTMs      int64 `json:"max_ttft_ms"`
+	TTFTSamples    int64 `json:"ttft_samples"`
 }
 
 // SummaryResult wraps the buckets plus the truncation flag.

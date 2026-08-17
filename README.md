@@ -2,7 +2,7 @@
 
 CLIProxyAPI 的持久化用量统计插件。记录每次请求的用量，写入本地 SQLite；提供查询/删除接口。字段命名对齐上游 `usage.Record` / `usage.Detail`。
 
-当前版本：`0.2.0`
+当前版本：`0.3.0`
 
 ## 建议使用配套的前端面板
 
@@ -51,10 +51,14 @@ plugins:
 
 ```
 GET /v0/management/plugins/usage-statistics/usage/summary
-    ?start=<RFC3339>&end=<RFC3339>&bucket=hour|day|month
+    ?start=<RFC3339>&end=<RFC3339>&bucket=15m|hour|day|month
 ```
 
-在 SQL 侧按「时间桶 × api_key × provider × model」聚合，响应大小只取决于组合数而非请求量。`bucket` 缺省为 `day`。
+在 SQL 侧按「时间桶 × api_key × provider × model × source × auth_index」聚合，响应大小只取决于组合数而非请求量。`bucket` 缺省为 `day`。
+
+包含 `source` / `auth_index` 是因为同一个 api_key 可能由多个凭证轮流承担，按 api_key 分组会把它们合并成一行，凭证维度的统计就无法还原。
+
+**平均值只统计上报了该指标的请求**：`ttft_ms = 0` 表示该请求根本没测到首字节，把这些 0 算进平均会拉低结果。因此同时返回 `latency_samples` / `ttft_samples`，供调用方跨桶做加权平均（直接平均两个桶的 `avg_*` 是错的）。
 
 ```jsonc
 {
@@ -64,6 +68,8 @@ GET /v0/management/plugins/usage-statistics/usage/summary
       "api_key": "…",
       "provider": "anthropic",
       "model": "claude-sonnet-4-5",
+      "source": "claude-code",
+      "auth_index": "auth-1",
       "requests": 128,
       "failures": 3,
       "tokens": {
@@ -73,13 +79,18 @@ GET /v0/management/plugins/usage-statistics/usage/summary
       },
       "avg_latency_ms": 1250,
       "max_latency_ms": 8300,
-      "avg_ttft_ms": 210
+      "latency_samples": 128,
+      "avg_ttft_ms": 210,
+      "max_ttft_ms": 900,
+      "ttft_samples": 126
     }
   ],
   "bucket_by": "day",
   "truncated": false
 }
 ```
+
+`bucket=15m` 用于服务健康类的细粒度视图（小时桶无法在客户端再拆分），桶键形如 `2026-05-02T10:30`。请配合较短的时间范围使用。
 
 ### 明细查询（下钻，keyset 分页）
 

@@ -422,10 +422,15 @@ func reverseDetails(details []RequestDetail) {
 }
 
 // Summary aggregates usage in SQL instead of shipping raw rows. The response is
-// bounded by distinct (bucket, api_key, provider, model) combinations, which is
-// what makes it cheap: the panel's window collapses from thousands of records
-// to a few hundred buckets, and every downstream cost (JSON marshal, the base64
-// ABI envelope, the host-side decode) shrinks with it.
+// bounded by distinct dimension combinations, which is what makes it cheap: a
+// week-long window collapses from thousands of records to a few hundred buckets,
+// and every downstream cost (JSON marshal, the base64 ABI envelope, the
+// host-side decode) shrinks with it.
+//
+// Averages deliberately exclude rows that reported no timing: a request with
+// ttft_ms = 0 never measured a first byte, and folding those zeros into the mean
+// would understate it. avg() skips NULL, so the CASE yields exactly that, and
+// the paired sample counts let a caller re-weight averages across buckets.
 //
 // Like Query, the cap keeps the newest buckets and asks for one extra row so
 // truncation is exact.
@@ -436,17 +441,22 @@ func (s *SQLiteStore) Summary(ctx context.Context, q SummaryQuery) (SummaryResul
 	}
 	conds, args := rangeConditions(q.Range)
 	args = append(args, summaryMaxBuckets+1)
-	// The prefix length comes from a closed enum, never from caller input, so
+	// The bucket expression comes from a closed enum, never from caller input, so
 	// inlining it carries no injection risk and keeps the plan cacheable.
-	prefix := strconv.Itoa(result.BucketBy.prefixLen())
-	query := `SELECT substr(timestamp, 1, ` + prefix + `) AS bucket, api_key, provider, model,
+	query := `SELECT ` + result.BucketBy.bucketExpr() + ` AS bucket,
+       api_key, provider, model, source, auth_index,
        count(*), sum(failed),
        sum(input_tokens), sum(output_tokens), sum(reasoning_tokens), sum(cached_tokens),
        sum(cache_read_tokens), sum(cache_creation_tokens), sum(total_tokens),
-       CAST(avg(latency_ms) AS INTEGER), max(latency_ms), CAST(avg(ttft_ms) AS INTEGER)
+       COALESCE(CAST(avg(CASE WHEN latency_ms > 0 THEN latency_ms END) AS INTEGER), 0),
+       COALESCE(max(latency_ms), 0),
+       sum(CASE WHEN latency_ms > 0 THEN 1 ELSE 0 END),
+       COALESCE(CAST(avg(CASE WHEN ttft_ms > 0 THEN ttft_ms END) AS INTEGER), 0),
+       COALESCE(max(ttft_ms), 0),
+       sum(CASE WHEN ttft_ms > 0 THEN 1 ELSE 0 END)
 FROM usage_records` + whereClause(conds) + `
-GROUP BY bucket, api_key, provider, model
-ORDER BY bucket DESC, api_key DESC, provider DESC, model DESC
+GROUP BY bucket, api_key, provider, model, source, auth_index
+ORDER BY bucket DESC, api_key DESC, provider DESC, model DESC, source DESC, auth_index DESC
 LIMIT ?`
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
@@ -461,11 +471,12 @@ LIMIT ?`
 		}
 		var b SummaryBucket
 		if err := rows.Scan(
-			&b.Bucket, &b.APIKey, &b.Provider, &b.Model,
+			&b.Bucket, &b.APIKey, &b.Provider, &b.Model, &b.Source, &b.AuthIndex,
 			&b.Requests, &b.Failures,
 			&b.Tokens.InputTokens, &b.Tokens.OutputTokens, &b.Tokens.ReasoningTokens, &b.Tokens.CachedTokens,
 			&b.Tokens.CacheReadTokens, &b.Tokens.CacheCreationTokens, &b.Tokens.TotalTokens,
-			&b.AvgLatencyMs, &b.MaxLatencyMs, &b.AvgTTFTMs,
+			&b.AvgLatencyMs, &b.MaxLatencyMs, &b.LatencySamples,
+			&b.AvgTTFTMs, &b.MaxTTFTMs, &b.TTFTSamples,
 		); err != nil {
 			return result, fmt.Errorf("usage sqlite summary scan: %w", err)
 		}
