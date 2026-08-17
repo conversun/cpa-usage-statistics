@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,13 +21,25 @@ const (
 	// managementUsagePath is the plugin-owned management route path. The host
 	// mounts it under /v0/management, producing
 	// /v0/management/plugins/usage-statistics/usage.
-	managementUsagePath = "/plugins/" + pluginID + "/usage"
-	insertTimeout       = 5 * time.Second
+	managementUsagePath        = "/plugins/" + pluginID + "/usage"
+	managementUsageSummaryPath = managementUsagePath + "/summary"
+	managementUsageRecordsPath = managementUsagePath + "/records"
+
+	insertTimeout = 5 * time.Second
+	// queryTimeout is deliberately separate from insertTimeout. Sharing one
+	// budget meant a slow read and a dropped usage record competed for the same
+	// deadline; a read may legitimately take longer than a write.
+	queryTimeout = 30 * time.Second
+	// cleanupTimeout bounds one full retention pass. It is generous because the
+	// pass now runs on a background ticker rather than in front of a user request.
+	cleanupTimeout      = 10 * time.Minute
+	cleanupInterval     = time.Hour
+	cleanupInitialDelay = time.Minute
 )
 
 // Overridable at build time via -ldflags "-X main.pluginVersion=...".
 var (
-	pluginVersion    = "0.1.0"
+	pluginVersion    = "0.2.0"
 	pluginAuthor     = "Fwindy"
 	pluginRepository = "https://github.com/Fwindy/cpa-usage-statistics"
 )
@@ -137,7 +150,9 @@ type managementRoute struct {
 func managementRegistration() managementRegistrationPayload {
 	return managementRegistrationPayload{
 		Routes: []managementRoute{
-			{Method: "GET", Path: managementUsagePath, Description: "Query persisted usage grouped by api key and model."},
+			{Method: "GET", Path: managementUsagePath, Description: "Query persisted usage grouped by api key and model. Returns the newest records up to a fixed cap; prefer /usage/summary for wide ranges."},
+			{Method: "GET", Path: managementUsageSummaryPath, Description: "Aggregated usage per time bucket, api key, provider and model. bucket=hour|day|month."},
+			{Method: "GET", Path: managementUsageRecordsPath, Description: "Keyset-paginated raw usage records. Filters: id, api_key, provider, model, failed, limit, cursor."},
 			{Method: "DELETE", Path: managementUsagePath, Description: "Delete persisted usage records by id."},
 		},
 	}
@@ -188,16 +203,16 @@ func handleUsage(request []byte) ([]byte, error) {
 	if err := json.Unmarshal(request, &rec); err != nil {
 		return okEnvelope(map[string]any{"ignored": true})
 	}
-	store := currentStore()
+	store, release := acquireStore()
 	if store == nil {
 		return okEnvelope(map[string]any{"ignored": true})
 	}
+	defer release()
 	ctx, cancel := context.WithTimeout(context.Background(), insertTimeout)
 	defer cancel()
 	if err := store.Insert(ctx, toRecord(rec)); err != nil {
 		return nil, err
 	}
-	maybeCleanup()
 	return okEnvelope(map[string]any{"stored": true})
 }
 
@@ -273,11 +288,34 @@ func handleManagement(request []byte) ([]byte, error) {
 	}
 	switch strings.ToUpper(strings.TrimSpace(req.Method)) {
 	case "GET":
-		return usageGet(req)
+		switch routeSuffix(req.Path) {
+		case "summary":
+			return usageSummaryGet(req)
+		case "records":
+			return usageRecordsGet(req)
+		default:
+			return usageGet(req)
+		}
 	case "DELETE":
 		return usageDelete(req)
 	default:
 		return okEnvelope(jsonManagementResponse(405, map[string]string{"error": "method not allowed"}))
+	}
+}
+
+// routeSuffix classifies a request by its trailing path segments. The host may
+// present the path with or without its /v0/management prefix, so match on the
+// suffix rather than on equality. Anything unrecognized falls through to the
+// legacy usage route, which is also what hosts that send no path at all get.
+func routeSuffix(path string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(path), "/")
+	switch {
+	case strings.HasSuffix(trimmed, "/usage/summary"):
+		return "summary"
+	case strings.HasSuffix(trimmed, "/usage/records"):
+		return "records"
+	default:
+		return "usage"
 	}
 }
 
@@ -286,24 +324,34 @@ func usageGet(req managementRequest) ([]byte, error) {
 	if errResp != nil {
 		return okEnvelope(*errResp)
 	}
-	store := currentStore()
+	store, release := acquireStore()
 	if store == nil {
 		return okEnvelope(jsonManagementResponse(200, APIUsage{}))
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), insertTimeout)
+	defer release()
+	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
 	defer cancel()
-	result, err := store.Query(ctx, rng)
+	result, truncated, err := store.Query(ctx, rng)
 	if err != nil {
 		return okEnvelope(jsonManagementResponse(500, map[string]string{"error": "failed to query usage"}))
 	}
-	return okEnvelope(jsonManagementResponse(200, result))
+	resp := jsonManagementResponse(200, result)
+	if truncated {
+		// Advisory only: the range hit the row cap, so the caller is seeing the
+		// newest records and older ones in range were left out. /usage/summary and
+		// /usage/records cover wide ranges without dropping anything.
+		resp.Headers["X-Usage-Truncated"] = []string{"true"}
+		resp.Headers["X-Usage-Row-Limit"] = []string{strconv.Itoa(legacyQueryMaxRows)}
+	}
+	return okEnvelope(resp)
 }
 
 func usageDelete(req managementRequest) ([]byte, error) {
-	store := currentStore()
+	store, release := acquireStore()
 	if store == nil {
 		return okEnvelope(jsonManagementResponse(400, map[string]string{"error": "usage store unavailable"}))
 	}
+	defer release()
 	var body deleteUsageRequest
 	if len(req.Body) > 0 {
 		if err := json.Unmarshal(req.Body, &body); err != nil {
@@ -333,6 +381,86 @@ func usageDelete(req managementRequest) ([]byte, error) {
 		return okEnvelope(jsonManagementResponse(500, map[string]string{"error": "failed to delete usage records"}))
 	}
 	return okEnvelope(jsonManagementResponse(200, result))
+}
+
+// usageSummaryGet answers with SQL-side aggregates instead of raw rows. This is
+// the route a dashboard should poll: its response scales with the number of
+// distinct bucket/key/model combinations, not with request volume.
+func usageSummaryGet(req managementRequest) ([]byte, error) {
+	rng, errResp := parseUsageRange(req.Query)
+	if errResp != nil {
+		return okEnvelope(*errResp)
+	}
+	store, release := acquireStore()
+	if store == nil {
+		return okEnvelope(jsonManagementResponse(200, SummaryResult{Buckets: []SummaryBucket{}, BucketBy: BucketDay}))
+	}
+	defer release()
+	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+	defer cancel()
+	result, err := store.Summary(ctx, SummaryQuery{
+		Range:  rng,
+		Bucket: normalizeBucket(strings.TrimSpace(firstValue(req.Query, "bucket"))),
+	})
+	if err != nil {
+		return okEnvelope(jsonManagementResponse(500, map[string]string{"error": "failed to summarize usage"}))
+	}
+	return okEnvelope(jsonManagementResponse(200, result))
+}
+
+// usageRecordsGet serves raw-record drill-down one keyset page at a time. Pass
+// the returned next_cursor back verbatim to continue; supply id to fetch a
+// single record with its full, untruncated failure body.
+func usageRecordsGet(req managementRequest) ([]byte, error) {
+	rng, errResp := parseUsageRange(req.Query)
+	if errResp != nil {
+		return okEnvelope(*errResp)
+	}
+	q := RecordsQuery{
+		Range:      rng,
+		ID:         strings.TrimSpace(firstValue(req.Query, "id")),
+		APIKey:     strings.TrimSpace(firstValue(req.Query, "api_key")),
+		Provider:   strings.TrimSpace(firstValue(req.Query, "provider")),
+		Model:      strings.TrimSpace(firstValue(req.Query, "model")),
+		FailedOnly: isTruthy(firstValue(req.Query, "failed")),
+		Limit:      parseLimit(firstValue(req.Query, "limit")),
+	}
+	if raw := strings.TrimSpace(firstValue(req.Query, "cursor")); raw != "" {
+		afterTS, afterID, ok := decodeCursor(raw)
+		if !ok {
+			return okEnvelope(jsonManagementResponse(400, map[string]string{"error": "invalid cursor"}))
+		}
+		q.AfterTS, q.AfterID = afterTS, afterID
+	}
+	store, release := acquireStore()
+	if store == nil {
+		return okEnvelope(jsonManagementResponse(200, RecordsPage{Records: []RequestDetail{}}))
+	}
+	defer release()
+	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+	defer cancel()
+	page, err := store.Records(ctx, q)
+	if err != nil {
+		return okEnvelope(jsonManagementResponse(500, map[string]string{"error": "failed to query usage records"}))
+	}
+	return okEnvelope(jsonManagementResponse(200, page))
+}
+
+func isTruthy(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes":
+		return true
+	}
+	return false
+}
+
+// parseLimit returns 0 for anything unusable so the store applies its default.
+func parseLimit(raw string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
 }
 
 func parseUsageRange(query map[string][]string) (QueryRange, *managementResponse) {
@@ -387,17 +515,36 @@ var (
 
 	retentionDays atomic.Int64
 
-	cleanupMu   sync.Mutex
-	lastCleanup time.Time
+	// cleanupMu guards the retention worker's lifecycle handles. cancel stops the
+	// loop; done is closed by the loop on exit so shutdown can join it instead of
+	// pulling the database out from under an in-flight prune.
+	cleanupMu     sync.Mutex
+	cleanupCancel context.CancelFunc
+	cleanupDone   chan struct{}
 )
 
-func currentStore() *SQLiteStore {
+// acquireStore returns the live store together with a release func, holding the
+// read lock for the whole database operation.
+//
+// Returning a bare pointer (the previous currentStore) let a caller keep using a
+// store that ensureStore or closeStore had already closed, surfacing as
+// "sql: database is closed" and a dropped usage record. Holding the read lock
+// instead makes reconfigure and shutdown wait for active operations to finish.
+// Callers MUST defer the returned release func.
+func acquireStore() (*SQLiteStore, func()) {
 	storeMu.RLock()
-	defer storeMu.RUnlock()
-	return globalStore
+	if globalStore == nil {
+		storeMu.RUnlock()
+		return nil, func() {}
+	}
+	return globalStore, storeMu.RUnlock
 }
 
 func closeStore() {
+	// Stop and join the retention worker BEFORE taking the write lock. The worker
+	// takes the read lock, so cancelling while holding the write lock would
+	// deadlock; cancelling first lets an in-flight prune unwind and release it.
+	stopCleanupWorker()
 	storeMu.Lock()
 	defer storeMu.Unlock()
 	if globalStore != nil {
@@ -429,26 +576,71 @@ func ensureStore(cfg pluginConfig) error {
 	return nil
 }
 
-func maybeCleanup() {
+// startCleanupWorker (re)starts retention pruning on a background ticker.
+//
+// Retention used to run inline on the ingestion path, which placed a bulk DELETE
+// directly in front of a user's proxied request. On the single shared connection
+// that meant a large prune could stall live traffic for seconds. Running it on
+// its own goroutine makes ingestion latency independent of how much there is to
+// prune.
+//
+// Restarting on every configure is deliberate: it re-arms the short initial
+// delay so a newly enabled retention policy takes effect promptly instead of
+// waiting out the remainder of an hourly tick.
+func startCleanupWorker() {
+	stopCleanupWorker()
+
+	cleanupMu.Lock()
+	defer cleanupMu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	cleanupCancel = cancel
+	cleanupDone = done
+	go cleanupLoop(ctx, done)
+}
+
+// stopCleanupWorker cancels the worker and waits for it to exit. Safe to call
+// when no worker is running, and safe to call repeatedly.
+func stopCleanupWorker() {
+	cleanupMu.Lock()
+	cancel, done := cleanupCancel, cleanupDone
+	cleanupCancel, cleanupDone = nil, nil
+	cleanupMu.Unlock()
+
+	if cancel == nil {
+		return
+	}
+	cancel()
+	<-done
+}
+
+func cleanupLoop(ctx context.Context, done chan struct{}) {
+	defer close(done)
+	timer := time.NewTimer(cleanupInitialDelay)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			runRetentionCleanup(ctx)
+			timer.Reset(cleanupInterval)
+		}
+	}
+}
+
+func runRetentionCleanup(parent context.Context) {
 	days := retentionDays.Load()
 	if days <= 0 {
 		return
 	}
-	cleanupMu.Lock()
-	now := time.Now()
-	if !lastCleanup.IsZero() && now.Sub(lastCleanup) < time.Hour {
-		cleanupMu.Unlock()
-		return
-	}
-	lastCleanup = now
-	cleanupMu.Unlock()
-
-	store := currentStore()
+	store, release := acquireStore()
 	if store == nil {
 		return
 	}
-	cutoff := now.Add(-time.Duration(days) * 24 * time.Hour)
-	ctx, cancel := context.WithTimeout(context.Background(), insertTimeout)
+	defer release()
+	cutoff := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
+	ctx, cancel := context.WithTimeout(parent, cleanupTimeout)
 	defer cancel()
 	_, _ = store.DeleteBefore(ctx, cutoff)
 }
@@ -475,12 +667,7 @@ func configurePlugin(request []byte) error {
 	if err := ensureStore(cfg); err != nil {
 		return err
 	}
-	if cfg.RetentionDays > 0 {
-		cleanupMu.Lock()
-		lastCleanup = time.Time{}
-		cleanupMu.Unlock()
-		maybeCleanup()
-	}
+	startCleanupWorker()
 	return nil
 }
 

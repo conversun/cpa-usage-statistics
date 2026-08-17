@@ -2,7 +2,7 @@
 
 CLIProxyAPI 的持久化用量统计插件。记录每次请求的用量，写入本地 SQLite；提供查询/删除接口。字段命名对齐上游 `usage.Record` / `usage.Detail`。
 
-当前版本：`0.1.0`
+当前版本：`0.2.0`
 
 ## 建议使用配套的前端面板
 
@@ -10,9 +10,9 @@ CLIProxyAPI 的持久化用量统计插件。记录每次请求的用量，写�
 
 ## 功能
 
-- 接收上游用量记录并持久化到 SQLite。
-- 提供受管理鉴权保护的查询/删除接口。
-- 可选按天数保留清理。
+- 接收上游用量记录并持久化到 SQLite（WAL，写入不阻塞查询）。
+- 提供受管理鉴权保护的聚合查询、明细分页查询与删除接口。
+- 可选按天数保留清理，后台批量执行，不占用请求路径。
 
 ## 安装
 
@@ -47,13 +47,83 @@ plugins:
 
 均为受管理鉴权保护的管理路由（宿主自动加 `/v0/management` 前缀）：
 
-### 查询
+### 聚合查询（推荐面板使用）
+
+```
+GET /v0/management/plugins/usage-statistics/usage/summary
+    ?start=<RFC3339>&end=<RFC3339>&bucket=hour|day|month
+```
+
+在 SQL 侧按「时间桶 × api_key × provider × model」聚合，响应大小只取决于组合数而非请求量。`bucket` 缺省为 `day`。
+
+```jsonc
+{
+  "buckets": [
+    {
+      "bucket": "2026-05-02",
+      "api_key": "…",
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-5",
+      "requests": 128,
+      "failures": 3,
+      "tokens": {
+        "input_tokens": 10240, "output_tokens": 20480, "reasoning_tokens": 512,
+        "cached_tokens": 0, "cache_read_tokens": 0, "cache_creation_tokens": 0,
+        "total_tokens": 31232
+      },
+      "avg_latency_ms": 1250,
+      "max_latency_ms": 8300,
+      "avg_ttft_ms": 210
+    }
+  ],
+  "bucket_by": "day",
+  "truncated": false
+}
+```
+
+### 明细查询（下钻，keyset 分页）
+
+```
+GET /v0/management/plugins/usage-statistics/usage/records
+    ?start=<RFC3339>&end=<RFC3339>
+    &api_key=&provider=&model=&failed=true
+    &limit=100&cursor=<next_cursor>
+```
+
+按 `(timestamp, id)` 游标分页，翻到第 N 页与第 1 页开销相同。把响应里的 `next_cursor` 原样回传即可取下一页；`has_more` 为 `false` 时到底。`limit` 缺省 100、上限 1000。
+
+列表里的 `failure_body` 只返回前 500 字节（按 UTF-8 边界截断，不会切断多字节字符）。要完整错误文本，用 `?id=<record-id>` 查单条。
+
+```jsonc
+{
+  "records": [
+    {
+      "id": "…",
+      "timestamp": "2026-05-02T10:30:00Z",
+      "api_key": "…",
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-5",
+      "source": "claude-code",
+      "latency_ms": 1250,
+      "ttft_ms": 200,
+      "tokens": { "input_tokens": 10, "output_tokens": 20, "total_tokens": 33 },
+      "failed": true,
+      "failure_status_code": 429,
+      "failure_body": "rate limited"
+    }
+  ],
+  "next_cursor": "…",
+  "has_more": true
+}
+```
+
+### 原始查询（旧接口，保持兼容）
 
 ```
 GET /v0/management/plugins/usage-statistics/usage?start=<RFC3339>&end=<RFC3339>
 ```
 
-响应按「分组键（api_key 或 provider）→ 模型」两层聚合：
+响应按「分组键（api_key 或 provider）→ 模型」两层聚合，形状与 0.1.0 完全一致：
 
 ```jsonc
 {
@@ -83,6 +153,8 @@ GET /v0/management/plugins/usage-statistics/usage?start=<RFC3339>&end=<RFC3339>
 }
 ```
 
+该接口返回原始记录，响应大小随请求量线性增长，因此**最多返回最新的 10000 条**。命中上限时响应头带 `X-Usage-Truncated: true` 与 `X-Usage-Row-Limit: 10000`，被丢弃的是范围内更旧的记录。宽时间范围请改用 `/usage/summary`（图表）与 `/usage/records`（明细表）。
+
 ### 删除
 
 ```
@@ -97,3 +169,6 @@ Content-Type: application/json
 ## 说明
 
 - 本插件仅使用上游 `UsageRecord` ABI 现有字段。失败判定为 `Failed || failure_status_code >= 400`。
+- `failure_body` 写入时截断到 4096 字节（按 UTF-8 边界），避免单条异常错误撑爆库和响应。
+- 数据库使用 WAL 模式。**备份不能只拷 `usage.db`** —— 还有 `usage.db-wal` / `usage.db-shm` 两个附属文件，只拷主文件会得到陈旧或损坏的快照。请用 `sqlite3 usage.db ".backup out.db"` 或 `VACUUM INTO`。
+- 从 0.1.0 升级无需人工操作：首次打开时自动切到 WAL、补齐缺失列、建立 `idx_usage_ts_id` 并删除已冗余的旧索引。

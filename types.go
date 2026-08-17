@@ -38,8 +38,9 @@ type Record struct {
 	FailureBody       string
 }
 
-// RequestDetail is the outward JSON shape returned by the usage API. It omits
-// storage-only grouping fields (api_key/model live in the map keys).
+// RequestDetail is the outward JSON shape for one raw record. The legacy grouped
+// endpoint leaves APIKey empty because api_key and model live in its map keys;
+// the records endpoint sets APIKey so a flat list stays self-describing.
 type RequestDetail struct {
 	ID                string     `json:"id"`
 	Timestamp         time.Time  `json:"timestamp"`
@@ -47,6 +48,7 @@ type RequestDetail struct {
 	Model             string     `json:"model,omitempty"`
 	Alias             string     `json:"alias,omitempty"`
 	Source            string     `json:"source"`
+	APIKey            string     `json:"api_key,omitempty"`
 	AuthID            string     `json:"auth_id,omitempty"`
 	AuthIndex         string     `json:"auth_index"`
 	AuthType          string     `json:"auth_type,omitempty"`
@@ -74,4 +76,90 @@ type QueryRange struct {
 type DeleteResult struct {
 	Deleted int64    `json:"deleted"`
 	Missing []string `json:"missing"`
+}
+
+// BucketSize selects the summary time-bucket granularity. The stored timestamp
+// is a fixed-width RFC3339Nano UTC string, so a bucket is just a prefix of it.
+type BucketSize string
+
+const (
+	BucketHour  BucketSize = "hour"
+	BucketDay   BucketSize = "day"
+	BucketMonth BucketSize = "month"
+)
+
+// prefixLen returns how many leading timestamp characters identify the bucket:
+// 2026-08-17T06 (hour), 2026-08-17 (day), 2026-08 (month).
+func (b BucketSize) prefixLen() int {
+	switch b {
+	case BucketHour:
+		return 13
+	case BucketMonth:
+		return 7
+	default:
+		return 10
+	}
+}
+
+// normalizeBucket maps free-form input to a supported bucket, defaulting to day.
+func normalizeBucket(raw string) BucketSize {
+	switch BucketSize(raw) {
+	case BucketHour:
+		return BucketHour
+	case BucketMonth:
+		return BucketMonth
+	default:
+		return BucketDay
+	}
+}
+
+// SummaryQuery bounds an aggregated usage query.
+type SummaryQuery struct {
+	Range  QueryRange
+	Bucket BucketSize
+}
+
+// SummaryBucket is one pre-aggregated row. Aggregation happens in SQL, so the
+// response size is bounded by distinct (bucket, api_key, provider, model)
+// combinations rather than by the number of underlying requests.
+type SummaryBucket struct {
+	Bucket       string     `json:"bucket"`
+	APIKey       string     `json:"api_key"`
+	Provider     string     `json:"provider"`
+	Model        string     `json:"model"`
+	Requests     int64      `json:"requests"`
+	Failures     int64      `json:"failures"`
+	Tokens       TokenStats `json:"tokens"`
+	AvgLatencyMs int64      `json:"avg_latency_ms"`
+	MaxLatencyMs int64      `json:"max_latency_ms"`
+	AvgTTFTMs    int64      `json:"avg_ttft_ms"`
+}
+
+// SummaryResult wraps the buckets plus the truncation flag.
+type SummaryResult struct {
+	Buckets   []SummaryBucket `json:"buckets"`
+	BucketBy  BucketSize      `json:"bucket_by"`
+	Truncated bool            `json:"truncated"`
+}
+
+// RecordsQuery selects raw records for drill-down. Paging is keyset based on
+// (timestamp, id), which is the table's sort order, so page N costs the same as
+// page 1 -- unlike OFFSET, which re-walks every skipped row.
+type RecordsQuery struct {
+	Range      QueryRange
+	ID         string
+	APIKey     string
+	Provider   string
+	Model      string
+	FailedOnly bool
+	AfterTS    string
+	AfterID    string
+	Limit      int
+}
+
+// RecordsPage is one keyset page of raw records.
+type RecordsPage struct {
+	Records    []RequestDetail `json:"records"`
+	NextCursor string          `json:"next_cursor,omitempty"`
+	HasMore    bool            `json:"has_more"`
 }

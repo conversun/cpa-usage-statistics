@@ -3,16 +3,69 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite"
 )
 
 const sqliteTimestampLayout = "2006-01-02T15:04:05.000000000Z07:00"
+
+const (
+	// legacyQueryMaxRows caps the untyped /usage dump. It exists purely as an
+	// out-of-memory backstop: every stage downstream of Query (JSON marshal, the
+	// base64 ABI envelope, the host-side decode) allocates in proportion to the
+	// row count, so an unbounded range on a small host is a self-inflicted OOM.
+	// Callers that need more than this should page through /usage/records.
+	legacyQueryMaxRows = 10000
+
+	// summaryMaxBuckets bounds the aggregated response. Distinct
+	// (bucket, api_key, provider, model) combinations are normally in the low
+	// hundreds; this only guards against an absurd range at hour granularity.
+	summaryMaxBuckets = 20000
+
+	// recordsDefaultLimit / recordsMaxLimit bound one keyset page.
+	recordsDefaultLimit = 100
+	recordsMaxLimit     = 1000
+
+	// maxFailureBodyBytes bounds the stored upstream error text. Without this a
+	// single pathological multi-megabyte error would bloat both the database and
+	// every response that lists it.
+	maxFailureBodyBytes = 4096
+
+	// failureExcerptBytes is how much of failure_body list endpoints return. The
+	// full text is available from the single-record lookup.
+	failureExcerptBytes = 500
+
+	// pruneBatchRows / pruneBatchPause chunk retention deletes so a large prune
+	// never holds a write lock long enough to stall an in-flight insert.
+	pruneBatchRows  = 500
+	pruneBatchPause = 50 * time.Millisecond
+)
+
+// sqlitePragmas are applied through the DSN rather than db.Exec because
+// busy_timeout, cache_size and temp_store are per-connection settings. Running
+// them as statements would configure only whichever pooled connection happened
+// to serve that call, which silently breaks as soon as the pool grows.
+//
+// journal_mode=WAL is persisted in the file header and is safe here: the store
+// lives on a local filesystem (WAL requires working flock/mmap and must not be
+// used over NFS/SMB). Note that WAL adds usage.db-wal and usage.db-shm sidecar
+// files, so any backup must use sqlite3 .backup / VACUUM INTO rather than
+// copying usage.db alone.
+var sqlitePragmas = []string{
+	"_pragma=journal_mode(WAL)",
+	"_pragma=synchronous(NORMAL)",
+	"_pragma=busy_timeout(5000)",
+	"_pragma=cache_size(-4000)",
+	"_pragma=temp_store(MEMORY)",
+}
 
 // SQLiteStore persists usage records in a pure-Go SQLite database.
 type SQLiteStore struct {
@@ -27,11 +80,16 @@ func NewSQLiteStore(path string) (*SQLiteStore, error) {
 	if err := prepareSQLitePath(path); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", path+"?"+strings.Join(sqlitePragmas, "&"))
 	if err != nil {
 		return nil, fmt.Errorf("usage sqlite open: %w", err)
 	}
-	db.SetMaxOpenConns(1)
+	// WAL lets readers run concurrently with the single writer, so a slow panel
+	// query no longer blocks usage ingestion on the proxied-request hot path.
+	// Concurrent writers are serialized by SQLite and wait out busy_timeout.
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(4)
+	db.SetConnMaxIdleTime(5 * time.Minute)
 	store := &SQLiteStore{db: db}
 	if err := store.initSchema(context.Background()); err != nil {
 		_ = db.Close()
@@ -88,8 +146,18 @@ func (s *SQLiteStore) initSchema(ctx context.Context) error {
 	failure_status_code INTEGER NOT NULL DEFAULT 0 CHECK (failure_status_code >= 0),
 	failure_body TEXT NOT NULL DEFAULT ''
 )`,
-		`CREATE INDEX IF NOT EXISTS idx_usage_records_timestamp ON usage_records(timestamp)`,
-		`CREATE INDEX IF NOT EXISTS idx_usage_records_api_model ON usage_records(api_key, provider, model)`,
+		// id is TEXT PRIMARY KEY, not the rowid, so a timestamp-only index cannot
+		// satisfy ORDER BY timestamp, id -- SQLite fell back to a temp b-tree and
+		// sorted every matching row before LIMIT could apply. Indexing both columns
+		// makes the scan already-ordered, so keyset paging is O(page) not O(range).
+		`CREATE INDEX IF NOT EXISTS idx_usage_ts_id ON usage_records(timestamp, id)`,
+		// Redundant leading-column prefix of idx_usage_ts_id.
+		`DROP INDEX IF EXISTS idx_usage_records_timestamp`,
+		// Near-zero selectivity: a handful of distinct keys/providers/models over
+		// tens of thousands of rows, so it never beat seeking the timestamp index
+		// and filtering. Records' optional api_key/model filters do the same. Keeping
+		// it only cost a b-tree write on every ingestion.
+		`DROP INDEX IF EXISTS idx_usage_records_api_model`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -217,7 +285,7 @@ INSERT INTO usage_records (
 		tokens.TotalTokens,
 		boolToInt(record.Failed),
 		nonNegativeInt(record.FailureStatusCode),
-		strings.TrimSpace(record.FailureBody),
+		truncateUTF8(strings.TrimSpace(record.FailureBody), maxFailureBodyBytes),
 	)
 	if err != nil {
 		return fmt.Errorf("usage sqlite insert: %w", err)
@@ -225,82 +293,109 @@ INSERT INTO usage_records (
 	return nil
 }
 
-// Query returns usage grouped by api_key (or provider) then model.
-func (s *SQLiteStore) Query(ctx context.Context, rng QueryRange) (APIUsage, error) {
-	if s == nil || s.db == nil {
-		return APIUsage{}, nil
-	}
-	query := `
-SELECT id, timestamp, api_key, provider, model, alias, source, auth_id, auth_index, auth_type, executor_type,
+// recordColumns is the shared projection for raw-record reads. failure_body is
+// appended separately by each caller because list endpoints return only an
+// excerpt while the single-record lookup returns the full text.
+const recordColumns = `id, timestamp, api_key, provider, model, alias, source, auth_id, auth_index, auth_type, executor_type,
        reasoning_effort, service_tier, latency_ms, ttft_ms,
        input_tokens, output_tokens, reasoning_tokens, cached_tokens, cache_read_tokens, cache_creation_tokens, total_tokens,
-       failed, failure_status_code, failure_body
-FROM usage_records`
+       failed, failure_status_code`
+
+// scanRecord reads one recordColumns + failure_body row. api_key is returned
+// separately because the legacy grouped shape carries it as a map key rather
+// than a field; callers that want it inline assign it themselves.
+func scanRecord(rows *sql.Rows) (RequestDetail, string, error) {
+	var (
+		timestampText string
+		apiKey        string
+		failedInt     int
+		detail        RequestDetail
+	)
+	if err := rows.Scan(
+		&detail.ID, &timestampText, &apiKey, &detail.Provider, &detail.Model, &detail.Alias,
+		&detail.Source, &detail.AuthID, &detail.AuthIndex, &detail.AuthType, &detail.ExecutorType,
+		&detail.ReasoningEffort, &detail.ServiceTier, &detail.LatencyMs, &detail.TTFTMs,
+		&detail.Tokens.InputTokens, &detail.Tokens.OutputTokens, &detail.Tokens.ReasoningTokens,
+		&detail.Tokens.CachedTokens, &detail.Tokens.CacheReadTokens, &detail.Tokens.CacheCreationTokens,
+		&detail.Tokens.TotalTokens, &failedInt, &detail.FailureStatusCode, &detail.FailureBody,
+	); err != nil {
+		return detail, "", fmt.Errorf("usage sqlite scan: %w", err)
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, timestampText)
+	if err != nil {
+		return detail, "", fmt.Errorf("usage sqlite parse timestamp: %w", err)
+	}
+	detail.Timestamp = parsed.UTC()
+	detail.LatencyMs = nonNegative(detail.LatencyMs)
+	detail.TTFTMs = nonNegative(detail.TTFTMs)
+	detail.Failed = failedInt != 0
+	return detail, apiKey, nil
+}
+
+// rangeConditions builds the timestamp predicates shared by every read path.
+func rangeConditions(rng QueryRange) ([]string, []any) {
+	conds := make([]string, 0, 2)
 	args := make([]any, 0, 2)
-	where := make([]string, 0, 2)
 	if rng.Start != nil && !rng.Start.IsZero() {
-		where = append(where, "timestamp >= ?")
+		conds = append(conds, "timestamp >= ?")
 		args = append(args, formatTimestamp(*rng.Start))
 	}
 	if rng.End != nil && !rng.End.IsZero() {
-		where = append(where, "timestamp < ?")
+		conds = append(conds, "timestamp < ?")
 		args = append(args, formatTimestamp(*rng.End))
 	}
-	if len(where) > 0 {
-		query += " WHERE " + strings.Join(where, " AND ")
+	return conds, args
+}
+
+func whereClause(conds []string) string {
+	if len(conds) == 0 {
+		return ""
 	}
-	query += " ORDER BY timestamp ASC, id ASC"
+	return " WHERE " + strings.Join(conds, " AND ")
+}
+
+// Query returns usage grouped by api_key (or provider) then model.
+//
+// The row count is capped at legacyQueryMaxRows, and the cap keeps the NEWEST
+// rows: a usage panel that silently lost recent traffic would render stale.
+// The scan therefore walks the range descending and each group is reversed at
+// the end to restore the ascending order the legacy shape promises.
+//
+// One row beyond the cap is requested so truncation is detected exactly rather
+// than inferred from "we got exactly the cap", which would flag a range holding
+// precisely legacyQueryMaxRows rows as truncated when nothing was dropped.
+func (s *SQLiteStore) Query(ctx context.Context, rng QueryRange) (APIUsage, bool, error) {
+	if s == nil || s.db == nil {
+		return APIUsage{}, false, nil
+	}
+	conds, args := rangeConditions(rng)
+	args = append(args, legacyQueryMaxRows+1)
+	query := `SELECT ` + recordColumns + `, failure_body
+FROM usage_records` + whereClause(conds) + `
+ORDER BY timestamp DESC, id DESC
+LIMIT ?`
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("usage sqlite query: %w", err)
+		return nil, false, fmt.Errorf("usage sqlite query: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
 	result := APIUsage{}
+	scanned := 0
+	truncated := false
 	for rows.Next() {
-		var timestampText string
-		var apiKey string
-		var failedInt int
-		detail := RequestDetail{}
-		if err := rows.Scan(
-			&detail.ID,
-			&timestampText,
-			&apiKey,
-			&detail.Provider,
-			&detail.Model,
-			&detail.Alias,
-			&detail.Source,
-			&detail.AuthID,
-			&detail.AuthIndex,
-			&detail.AuthType,
-			&detail.ExecutorType,
-			&detail.ReasoningEffort,
-			&detail.ServiceTier,
-			&detail.LatencyMs,
-			&detail.TTFTMs,
-			&detail.Tokens.InputTokens,
-			&detail.Tokens.OutputTokens,
-			&detail.Tokens.ReasoningTokens,
-			&detail.Tokens.CachedTokens,
-			&detail.Tokens.CacheReadTokens,
-			&detail.Tokens.CacheCreationTokens,
-			&detail.Tokens.TotalTokens,
-			&failedInt,
-			&detail.FailureStatusCode,
-			&detail.FailureBody,
-		); err != nil {
-			return nil, fmt.Errorf("usage sqlite scan: %w", err)
+		if scanned == legacyQueryMaxRows {
+			// The probe row exists, so older rows in range were left out.
+			truncated = true
+			break
 		}
-		parsed, err := time.Parse(time.RFC3339Nano, timestampText)
+		detail, apiKey, err := scanRecord(rows)
 		if err != nil {
-			return nil, fmt.Errorf("usage sqlite parse timestamp: %w", err)
+			return nil, false, err
 		}
-		detail.Timestamp = parsed.UTC()
-		detail.LatencyMs = nonNegative(detail.LatencyMs)
-		detail.TTFTMs = nonNegative(detail.TTFTMs)
-		detail.Failed = failedInt != 0
-
+		detail.FailureBody = truncateUTF8(detail.FailureBody, maxFailureBodyBytes)
+		scanned++
 		key := groupingKey(apiKey, detail.Provider)
 		modelKey := normalizeModel(detail.Model)
 		if result[key] == nil {
@@ -309,9 +404,173 @@ FROM usage_records`
 		result[key][modelKey] = append(result[key][modelKey], detail)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("usage sqlite rows: %w", err)
+		return nil, false, fmt.Errorf("usage sqlite rows: %w", err)
+	}
+	for _, models := range result {
+		for _, details := range models {
+			reverseDetails(details)
+		}
+	}
+	return result, truncated, nil
+}
+
+// reverseDetails flips a descending scan back to ascending in place.
+func reverseDetails(details []RequestDetail) {
+	for i, j := 0, len(details)-1; i < j; i, j = i+1, j-1 {
+		details[i], details[j] = details[j], details[i]
+	}
+}
+
+// Summary aggregates usage in SQL instead of shipping raw rows. The response is
+// bounded by distinct (bucket, api_key, provider, model) combinations, which is
+// what makes it cheap: the panel's window collapses from thousands of records
+// to a few hundred buckets, and every downstream cost (JSON marshal, the base64
+// ABI envelope, the host-side decode) shrinks with it.
+//
+// Like Query, the cap keeps the newest buckets and asks for one extra row so
+// truncation is exact.
+func (s *SQLiteStore) Summary(ctx context.Context, q SummaryQuery) (SummaryResult, error) {
+	result := SummaryResult{Buckets: []SummaryBucket{}, BucketBy: normalizeBucket(string(q.Bucket))}
+	if s == nil || s.db == nil {
+		return result, nil
+	}
+	conds, args := rangeConditions(q.Range)
+	args = append(args, summaryMaxBuckets+1)
+	// The prefix length comes from a closed enum, never from caller input, so
+	// inlining it carries no injection risk and keeps the plan cacheable.
+	prefix := strconv.Itoa(result.BucketBy.prefixLen())
+	query := `SELECT substr(timestamp, 1, ` + prefix + `) AS bucket, api_key, provider, model,
+       count(*), sum(failed),
+       sum(input_tokens), sum(output_tokens), sum(reasoning_tokens), sum(cached_tokens),
+       sum(cache_read_tokens), sum(cache_creation_tokens), sum(total_tokens),
+       CAST(avg(latency_ms) AS INTEGER), max(latency_ms), CAST(avg(ttft_ms) AS INTEGER)
+FROM usage_records` + whereClause(conds) + `
+GROUP BY bucket, api_key, provider, model
+ORDER BY bucket DESC, api_key DESC, provider DESC, model DESC
+LIMIT ?`
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return result, fmt.Errorf("usage sqlite summary: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		if len(result.Buckets) == summaryMaxBuckets {
+			result.Truncated = true
+			break
+		}
+		var b SummaryBucket
+		if err := rows.Scan(
+			&b.Bucket, &b.APIKey, &b.Provider, &b.Model,
+			&b.Requests, &b.Failures,
+			&b.Tokens.InputTokens, &b.Tokens.OutputTokens, &b.Tokens.ReasoningTokens, &b.Tokens.CachedTokens,
+			&b.Tokens.CacheReadTokens, &b.Tokens.CacheCreationTokens, &b.Tokens.TotalTokens,
+			&b.AvgLatencyMs, &b.MaxLatencyMs, &b.AvgTTFTMs,
+		); err != nil {
+			return result, fmt.Errorf("usage sqlite summary scan: %w", err)
+		}
+		result.Buckets = append(result.Buckets, b)
+	}
+	if err := rows.Err(); err != nil {
+		return result, fmt.Errorf("usage sqlite summary rows: %w", err)
+	}
+	// Restore the ascending composite-key order the descending scan inverted.
+	for i, j := 0, len(result.Buckets)-1; i < j; i, j = i+1, j-1 {
+		result.Buckets[i], result.Buckets[j] = result.Buckets[j], result.Buckets[i]
 	}
 	return result, nil
+}
+
+// Records returns one keyset page of raw records for drill-down. Paging seeks on
+// (timestamp, id) -- the index order -- so page N costs the same as page 1,
+// unlike OFFSET which re-walks every skipped row.
+func (s *SQLiteStore) Records(ctx context.Context, q RecordsQuery) (RecordsPage, error) {
+	page := RecordsPage{Records: []RequestDetail{}}
+	if s == nil || s.db == nil {
+		return page, nil
+	}
+	limit := q.Limit
+	if limit <= 0 {
+		limit = recordsDefaultLimit
+	}
+	if limit > recordsMaxLimit {
+		limit = recordsMaxLimit
+	}
+
+	conds, args := rangeConditions(q.Range)
+	single := strings.TrimSpace(q.ID) != ""
+	if single {
+		conds = append(conds, "id = ?")
+		args = append(args, strings.TrimSpace(q.ID))
+	}
+	if key := strings.TrimSpace(q.APIKey); key != "" {
+		conds = append(conds, "api_key = ?")
+		args = append(args, key)
+	}
+	if provider := strings.TrimSpace(q.Provider); provider != "" {
+		conds = append(conds, "provider = ?")
+		args = append(args, provider)
+	}
+	if model := strings.TrimSpace(q.Model); model != "" {
+		conds = append(conds, "model = ?")
+		args = append(args, model)
+	}
+	if q.FailedOnly {
+		conds = append(conds, "failed = 1")
+	}
+	if ts := strings.TrimSpace(q.AfterTS); ts != "" {
+		// Row-value comparison so SQLite turns the cursor into an index seek.
+		conds = append(conds, "(timestamp, id) > (?, ?)")
+		args = append(args, ts, strings.TrimSpace(q.AfterID))
+	}
+
+	// List responses carry only an excerpt of failure_body; the single-record
+	// lookup returns the full text. This keeps one pathological upstream error
+	// from bloating an entire page.
+	//
+	// SQLite's substr() counts CHARACTERS, not bytes, so this alone would let a
+	// CJK excerpt reach 3x failureExcerptBytes. It stays because it cuts the bytes
+	// actually read out of the database; the exact byte bound is enforced on the
+	// scanned value below.
+	bodyExpr := "substr(failure_body, 1, " + strconv.Itoa(failureExcerptBytes) + ")"
+	if single {
+		bodyExpr = "failure_body"
+	}
+	// One extra row tells us whether another page exists without a second query.
+	args = append(args, limit+1)
+	query := `SELECT ` + recordColumns + `, ` + bodyExpr + `
+FROM usage_records` + whereClause(conds) + `
+ORDER BY timestamp ASC, id ASC
+LIMIT ?`
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return page, fmt.Errorf("usage sqlite records: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		detail, apiKey, err := scanRecord(rows)
+		if err != nil {
+			return page, err
+		}
+		detail.APIKey = apiKey
+		if single {
+			detail.FailureBody = truncateUTF8(detail.FailureBody, maxFailureBodyBytes)
+		} else {
+			detail.FailureBody = truncateUTF8(detail.FailureBody, failureExcerptBytes)
+		}
+		page.Records = append(page.Records, detail)
+	}
+	if err := rows.Err(); err != nil {
+		return page, fmt.Errorf("usage sqlite records rows: %w", err)
+	}
+	if len(page.Records) > limit {
+		page.Records = page.Records[:limit]
+		page.HasMore = true
+		last := page.Records[limit-1]
+		page.NextCursor = encodeCursor(formatTimestamp(last.Timestamp), last.ID)
+	}
+	return page, nil
 }
 
 // Delete removes records by id and reports which ids were absent.
@@ -344,19 +603,42 @@ func (s *SQLiteStore) Delete(ctx context.Context, ids []string) (DeleteResult, e
 }
 
 // DeleteBefore removes records older than cutoff and returns the deleted count.
+//
+// The delete is chunked. A single unbounded DELETE journals every touched table
+// and index page in one transaction, which on a large prune holds the write lock
+// long enough to stall concurrent ingestion; batching with a short pause between
+// chunks keeps each transaction small and yields the lock in between.
+//
+// The `rowid IN (SELECT ... LIMIT n)` form is used because plain DELETE ... LIMIT
+// requires SQLITE_ENABLE_UPDATE_DELETE_LIMIT, which is not compiled in by default.
 func (s *SQLiteStore) DeleteBefore(ctx context.Context, cutoff time.Time) (int64, error) {
 	if s == nil || s.db == nil {
 		return 0, nil
 	}
-	res, err := s.db.ExecContext(ctx, "DELETE FROM usage_records WHERE timestamp < ?", formatTimestamp(cutoff))
-	if err != nil {
-		return 0, fmt.Errorf("usage sqlite delete before: %w", err)
+	cutoffText := formatTimestamp(cutoff)
+	var total int64
+	for {
+		res, err := s.db.ExecContext(ctx, `
+DELETE FROM usage_records
+WHERE rowid IN (SELECT rowid FROM usage_records WHERE timestamp < ? LIMIT ?)`,
+			cutoffText, pruneBatchRows)
+		if err != nil {
+			return total, fmt.Errorf("usage sqlite delete before: %w", err)
+		}
+		rows, err := res.RowsAffected()
+		if err != nil {
+			return total, fmt.Errorf("usage sqlite rows affected: %w", err)
+		}
+		total += rows
+		if rows < pruneBatchRows {
+			return total, nil
+		}
+		select {
+		case <-ctx.Done():
+			return total, ctx.Err()
+		case <-time.After(pruneBatchPause):
+		}
 	}
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("usage sqlite rows affected: %w", err)
-	}
-	return rows, nil
 }
 
 // Close closes the underlying database.
@@ -436,4 +718,44 @@ func boolToInt(value bool) int {
 		return 1
 	}
 	return 0
+}
+
+// encodeCursor packs a keyset position into one opaque token so callers page by
+// echoing it back without knowing the sort key.
+func encodeCursor(timestamp, id string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(timestamp + "\x00" + id))
+}
+
+// decodeCursor unpacks a token from encodeCursor. It reports false for anything
+// malformed so a bad cursor becomes a 400 rather than a silently wrong page.
+func decodeCursor(cursor string) (string, string, bool) {
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(cursor))
+	if err != nil {
+		return "", "", false
+	}
+	timestamp, id, found := strings.Cut(string(raw), "\x00")
+	if !found || id == "" {
+		return "", "", false
+	}
+	// The cursor timestamp is compared against the stored column, so it must be
+	// byte-identical to what formatTimestamp writes. Round-tripping enforces
+	// exactly that and turns a fabricated or mangled cursor into a clean 400
+	// instead of a silently wrong page.
+	parsed, err := time.Parse(time.RFC3339Nano, timestamp)
+	if err != nil || formatTimestamp(parsed) != timestamp {
+		return "", "", false
+	}
+	return timestamp, id, true
+}
+
+// truncateUTF8 caps s at limit bytes without splitting a multi-byte rune.
+func truncateUTF8(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
